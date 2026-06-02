@@ -16,6 +16,11 @@ from mnist_realtime import DEFAULT_LIB, DEFAULT_MODEL, MnistGenerator
 
 
 PIXELS_PER_IMAGE = 28 * 28
+GRID_SIZE = 10
+GRID_SLOTS = GRID_SIZE * GRID_SIZE
+TILE_SCALE = 2
+TILE_SIZE = 28 * TILE_SCALE
+CANVAS_SIZE = GRID_SIZE * TILE_SIZE
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,35 @@ class LabelState:
             self._label = int(label)
 
 
+class ImageGrid:
+    def __init__(self, pygame, label: int):
+        self._pygame = pygame
+        self.label = int(label)
+        self.surface = pygame.Surface((CANVAS_SIZE, CANVAS_SIZE))
+        self.next_slot = 0
+        self.filled_slots = 0
+        self.clear(self.label)
+
+    def clear(self, label: int) -> None:
+        self.label = int(label)
+        self.next_slot = 0
+        self.filled_slots = 0
+        self.surface.fill((0, 0, 0))
+
+    def add(self, image: np.ndarray) -> None:
+        row = self.next_slot // GRID_SIZE
+        col = self.next_slot % GRID_SIZE
+        rect = self._pygame.Rect(
+            col * TILE_SIZE,
+            row * TILE_SIZE,
+            TILE_SIZE,
+            TILE_SIZE,
+        )
+        self.surface.blit(image_to_surface(self._pygame, image), rect.topleft)
+        self.next_slot = (self.next_slot + 1) % GRID_SLOTS
+        self.filled_slots = min(self.filled_slots + 1, GRID_SLOTS)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Realtime Qwen3 MNIST generator GUI.")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
@@ -51,7 +85,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--label", type=int, default=0)
-    parser.add_argument("--scale", type=int, default=16)
     parser.add_argument("--max-fps", type=int, default=120)
     parser.add_argument(
         "--headless-frames",
@@ -62,8 +95,6 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not 0 <= args.label <= 9:
         parser.error("--label must be in 0..9")
-    if args.scale < 4:
-        parser.error("--scale must be at least 4")
     if args.threads < 1:
         parser.error("--threads must be at least 1")
     if args.max_fps < 30:
@@ -119,10 +150,10 @@ def generator_worker(
         stop.set()
 
 
-def image_to_surface(pygame, image: np.ndarray, scale: int):
+def image_to_surface(pygame, image: np.ndarray):
     rgb = np.repeat(image[:, :, None], 3, axis=2)
     surface = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
-    return pygame.transform.scale(surface, (28 * scale, 28 * scale))
+    return pygame.transform.scale(surface, (TILE_SIZE, TILE_SIZE))
 
 
 def render_text(pygame, screen, font, text: str, pos, color) -> None:
@@ -162,7 +193,7 @@ def draw_app(
     screen,
     fonts: dict[str, object],
     last_frame: GeneratedFrame | None,
-    last_surface,
+    image_grid: ImageGrid,
     label_state: LabelState,
     button_rects: dict[int, object],
     stats: dict[str, float],
@@ -183,9 +214,8 @@ def draw_app(
     )
 
     pygame.draw.rect(screen, (0, 0, 0), canvas_rect, border_radius=8)
+    screen.blit(image_grid.surface, canvas_rect.topleft)
     pygame.draw.rect(screen, (82, 88, 96), canvas_rect, width=1, border_radius=8)
-    if last_surface is not None:
-        screen.blit(last_surface, canvas_rect.topleft)
 
     render_text(
         pygame,
@@ -215,6 +245,7 @@ def draw_app(
             f"{gen_ms:5.1f} ms/gen",
             f"{tok_s / 1000.0:5.1f}k tok/s",
             f"frame {int(stats.get('frames', 0))}",
+            f"grid {image_grid.filled_slots:3d}/{GRID_SLOTS}",
         ]
     for i, line in enumerate(lines):
         color = (220, 224, 229) if i == 0 else (166, 172, 181)
@@ -238,7 +269,7 @@ def run() -> None:
     pygame.init()
     pygame.font.init()
 
-    canvas_size = 28 * args.scale
+    canvas_size = CANVAS_SIZE
     width = canvas_size + 312
     height = max(canvas_size + 104, 560)
     screen = pygame.display.set_mode((width, height))
@@ -274,13 +305,14 @@ def run() -> None:
 
     clock = pygame.time.Clock()
     last_frame: GeneratedFrame | None = None
-    last_surface = None
+    image_grid = ImageGrid(pygame, args.label)
     stats: dict[str, float] = {"frames": 0.0, "fps_ema": 0.0}
     first_display_at: float | None = None
     previous_display_at: float | None = None
 
     try:
         while not stop.is_set():
+            selected_before_events = label_state.get()
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     stop.set()
@@ -295,32 +327,44 @@ def run() -> None:
                             label_state.set(digit)
                             break
 
+            selected_label = label_state.get()
+            if selected_label != selected_before_events:
+                image_grid.clear(selected_label)
+                last_frame = None
+                while True:
+                    try:
+                        frames.get_nowait()
+                    except queue.Empty:
+                        break
+
             if not errors.empty():
                 raise errors.get()
 
             try:
-                last_frame = frames.get_nowait()
+                next_frame = frames.get_nowait()
             except queue.Empty:
                 pass
             else:
-                now = time.perf_counter()
-                last_surface = image_to_surface(pygame, last_frame.image, args.scale)
-                if first_display_at is None:
-                    first_display_at = now
-                if previous_display_at is not None:
-                    dt = max(now - previous_display_at, 1e-9)
-                    instant_fps = 1.0 / dt
-                    current = stats["fps_ema"]
-                    stats["fps_ema"] = instant_fps if current == 0.0 else current * 0.85 + instant_fps * 0.15
-                previous_display_at = now
-                stats["frames"] += 1.0
+                if next_frame.label == label_state.get():
+                    last_frame = next_frame
+                    now = time.perf_counter()
+                    image_grid.add(last_frame.image)
+                    if first_display_at is None:
+                        first_display_at = now
+                    if previous_display_at is not None:
+                        dt = max(now - previous_display_at, 1e-9)
+                        instant_fps = 1.0 / dt
+                        current = stats["fps_ema"]
+                        stats["fps_ema"] = instant_fps if current == 0.0 else current * 0.85 + instant_fps * 0.15
+                    previous_display_at = now
+                    stats["frames"] += 1.0
 
             draw_app(
                 pygame,
                 screen,
                 fonts,
                 last_frame,
-                last_surface,
+                image_grid,
                 label_state,
                 button_rects,
                 stats,

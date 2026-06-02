@@ -1,7 +1,5 @@
 # mnistRealtime
 
-### EPILEPSY WARNING: This project's realtime demo can produce rapidly flashing images that may trigger seizures in photosensitive individuals. Viewer discretion is advised.
-
 *Disclaimer: this is exclusively vibe-coded and is entirely GPT-5.5's work. The README is GPT-5.5 written.*
 
 Realtime MNIST image generation using the Qwen3-2M MNIST checkpoint and the
@@ -72,10 +70,11 @@ sample grid PNG. Labels cycle through `0..9`.
 
 ## `realtime_gui.py`
 
-### EPILEPSY WARNING: This project's realtime demo can produce rapidly flashing images that may trigger seizures in photosensitive individuals. Viewer discretion is advised.
-
 Realtime Pygame viewer. It keeps one C-backed generator alive in a background
-thread and displays each generated image as it arrives.
+thread and displays each generated image as it arrives. Instead of replacing one
+large image, the viewer adds 56 px images row-wise to a 10x10 grid, clears the
+grid when the selected digit changes, and wraps back to the first slot after all
+100 slots are filled.
 
 ```bash
 python realtime_gui.py
@@ -91,7 +90,7 @@ Useful options:
 
 ```bash
 python realtime_gui.py --label 7 --temperature 0.8 --seed 1234
-python realtime_gui.py --threads 5 --scale 16 --max-fps 120
+python realtime_gui.py --threads 5 --max-fps 120
 python realtime_gui.py --headless-frames 20
 ```
 
@@ -103,4 +102,3 @@ without opening a window.
 
 - `realtime_10_samples.png`: default output from `test_realtime.py`
 - `libqwen3_mnist_realtime.dylib`: shared library built by `make`
-
