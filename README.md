@@ -1,5 +1,7 @@
 # mnistRealtime
 
+### EPILEPSY WARNING: This project's realtime demo can produce rapidly flashing images that may trigger seizures in photosensitive individuals. Viewer discretion is advised.
+
 *Disclaimer: this is exclusively vibe-coded and is entirely GPT-5.5's work. The README is GPT-5.5 written.*
 
 Realtime MNIST image generation using the Qwen3-2M MNIST checkpoint and the
@@ -69,6 +71,8 @@ The script prints model load time, images/sec, and tokens/sec, then writes a
 sample grid PNG. Labels cycle through `0..9`.
 
 ## `realtime_gui.py`
+
+### EPILEPSY WARNING: This project's realtime demo can produce rapidly flashing images that may trigger seizures in photosensitive individuals. Viewer discretion is advised.
 
 Realtime Pygame viewer. It keeps one C-backed generator alive in a background
 thread and displays each generated image as it arrives.
