@@ -70,11 +70,11 @@ sample grid PNG. Labels cycle through `0..9`.
 
 ## `realtime_gui.py`
 
-Realtime Pygame viewer. It keeps one C-backed generator alive in a background
-thread and displays each generated image as it arrives. Instead of replacing one
-large image, the viewer adds 56 px images row-wise to a 10x10 grid, clears the
-grid when the selected digit changes, and wraps back to the first slot after all
-100 slots are filled.
+Realtime Pygame viewer. It loads both the fast C-backed generator and the
+default `mlx_lm` generation path, then displays each generated image as it
+arrives. Instead of replacing one large image, the viewer adds 56 px images
+row-wise to a 10x10 grid, clears the grid when the selected digit or backend
+changes, and wraps back to the first slot after all 100 slots are filled.
 
 ```bash
 python realtime_gui.py
@@ -83,13 +83,16 @@ python realtime_gui.py
 Controls:
 
 - Click digit buttons `0..9` to choose the target label.
+- Click `FAST` or `MLX` to switch generation backend.
 - Press number keys `0..9` to choose the target label.
+- Press `f`, `m`, or `Tab` to switch generation backend.
 - Press `q` or `Esc` to quit.
 
 Useful options:
 
 ```bash
 python realtime_gui.py --label 7 --temperature 0.8 --seed 1234
+python realtime_gui.py --backend mlx --mlx-model Qwen3-2M-MNIST-GRPO
 python realtime_gui.py --threads 5 --max-fps 120
 python realtime_gui.py --headless-frames 20
 ```

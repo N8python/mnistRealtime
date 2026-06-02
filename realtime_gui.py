@@ -9,24 +9,30 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
-from mnist_realtime import DEFAULT_LIB, DEFAULT_MODEL, MnistGenerator
+from mnist_realtime import DEFAULT_LIB, DEFAULT_MODEL, ROOT, MnistGenerator
 
 
 PIXELS_PER_IMAGE = 28 * 28
+MNIST_LABEL_OFFSET = 32
+MNIST_PIXEL_TOKENS = 32
+DEFAULT_MLX_MODEL = ROOT / "Qwen3-2M-MNIST-GRPO"
 GRID_SIZE = 10
 GRID_SLOTS = GRID_SIZE * GRID_SIZE
 TILE_SCALE = 2
 TILE_SIZE = 28 * TILE_SCALE
 CANVAS_SIZE = GRID_SIZE * TILE_SIZE
+BACKENDS = ("fast", "mlx")
 
 
 @dataclass(frozen=True)
 class GeneratedFrame:
     image: np.ndarray
     label: int
+    backend: str
     seconds: float
     index: int
     created_at: float
@@ -46,6 +52,22 @@ class LabelState:
             return
         with self._lock:
             self._label = int(label)
+
+
+class BackendState:
+    def __init__(self, backend: str):
+        self._backend = backend
+        self._lock = threading.Lock()
+
+    def get(self) -> str:
+        with self._lock:
+            return self._backend
+
+    def set(self, backend: str) -> None:
+        if backend not in BACKENDS:
+            return
+        with self._lock:
+            self._backend = backend
 
 
 class ImageGrid:
@@ -77,14 +99,72 @@ class ImageGrid:
         self.filled_slots = min(self.filled_slots + 1, GRID_SLOTS)
 
 
+class MlxMnistGenerator:
+    def __init__(self, model_path: str | Path, *, temperature: float, seed: int):
+        import mlx.core as mx
+        from mlx_lm.generate import generate_step, make_sampler
+        from mlx_lm.utils import load
+
+        self.mx = mx
+        self.generate_step = generate_step
+        self.make_sampler = make_sampler
+        self.model_path = Path(model_path)
+        self.model, self.tokenizer = load(str(self.model_path))
+        self.mx.random.seed(int(seed) & 0xFFFFFFFF)
+        self.mx.eval(self.model.parameters())
+        self.set_temperature(temperature)
+
+    def set_temperature(self, temperature: float) -> None:
+        self.temperature = float(temperature)
+        self.sampler = self.make_sampler(temp=self.temperature)
+
+    def _pixel_logits_processor(self, tokens, logits):
+        del tokens
+        mx = self.mx
+        logits = logits.astype(mx.float32)
+        return mx.where(mx.arange(logits.shape[-1]) < MNIST_PIXEL_TOKENS, logits, -mx.inf)
+
+    def generate(
+        self,
+        label: int,
+        *,
+        should_abort: Callable[[], bool] | None = None,
+    ) -> np.ndarray | None:
+        mx = self.mx
+        prompt = mx.array([MNIST_LABEL_OFFSET + int(label)], dtype=mx.int32)
+        tokens: list[int] = []
+        for i, (token, _) in enumerate(
+            self.generate_step(
+                prompt,
+                self.model,
+                max_tokens=PIXELS_PER_IMAGE,
+                sampler=self.sampler,
+                logits_processors=[self._pixel_logits_processor],
+            )
+        ):
+            if should_abort is not None and i % 16 == 0 and should_abort():
+                return None
+            tokens.append(int(token))
+        if len(tokens) != PIXELS_PER_IMAGE:
+            return None
+        return mnist_tokens_to_pixels(tokens)
+
+
+def mnist_tokens_to_pixels(tokens: list[int]) -> np.ndarray:
+    values = np.asarray(tokens, dtype=np.uint8).reshape(28, 28)
+    return ((values.astype(np.float32) / 31.0) * 255.0 + 0.5).astype(np.uint8)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Realtime Qwen3 MNIST generator GUI.")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument("--mlx-model", type=Path, default=DEFAULT_MLX_MODEL)
     parser.add_argument("--lib", type=Path, default=DEFAULT_LIB)
     parser.add_argument("--threads", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--label", type=int, default=0)
+    parser.add_argument("--backend", choices=BACKENDS, default="fast")
     parser.add_argument("--max-fps", type=int, default=120)
     parser.add_argument(
         "--headless-frames",
@@ -105,6 +185,7 @@ def parse_args() -> argparse.Namespace:
 def generator_worker(
     args: argparse.Namespace,
     label_state: LabelState,
+    backend_state: BackendState,
     frames: queue.Queue[GeneratedFrame],
     ready: threading.Event,
     stop: threading.Event,
@@ -117,18 +198,37 @@ def generator_worker(
             threads=args.threads,
             temperature=args.temperature,
             seed=args.seed,
-        ) as gen:
+        ) as fast_gen:
+            mlx_gen = MlxMnistGenerator(
+                args.mlx_model,
+                temperature=args.temperature,
+                seed=args.seed,
+            )
             ready.set()
             frame_index = 0
             while not stop.is_set():
                 label = label_state.get()
+                backend = backend_state.get()
                 started = time.perf_counter()
-                image = gen.generate(label)
+                if backend == "fast":
+                    image = fast_gen.generate(label)
+                else:
+                    image = mlx_gen.generate(
+                        label,
+                        should_abort=lambda: (
+                            stop.is_set()
+                            or backend_state.get() != backend
+                            or label_state.get() != label
+                        ),
+                    )
+                    if image is None:
+                        continue
                 seconds = time.perf_counter() - started
                 frame_index += 1
                 frame = GeneratedFrame(
                     image=image,
                     label=label,
+                    backend=backend,
                     seconds=seconds,
                     index=frame_index,
                     created_at=time.perf_counter(),
@@ -188,6 +288,18 @@ def build_button_rects(pygame, panel_x: int, panel_y: int) -> dict[int, object]:
     return rects
 
 
+def build_backend_rects(pygame, button_rects: dict[int, object]) -> dict[str, object]:
+    left = button_rects[8].left
+    y = button_rects[8].bottom + 22
+    width = 74
+    height = 42
+    gap = 10
+    return {
+        "fast": pygame.Rect(left, y, width, height),
+        "mlx": pygame.Rect(left + width + gap, y, width, height),
+    }
+
+
 def draw_app(
     pygame,
     screen,
@@ -195,7 +307,9 @@ def draw_app(
     last_frame: GeneratedFrame | None,
     image_grid: ImageGrid,
     label_state: LabelState,
+    backend_state: BackendState,
     button_rects: dict[int, object],
+    backend_rects: dict[str, object],
     stats: dict[str, float],
     canvas_rect,
     panel_x: int,
@@ -229,10 +343,22 @@ def draw_app(
     for digit, rect in button_rects.items():
         draw_button(pygame, screen, fonts["button"], rect, str(digit), digit == selected_label)
 
-    metric_y = button_rects[8].bottom + 34
+    selected_backend = backend_state.get()
+    for backend, rect in backend_rects.items():
+        draw_button(
+            pygame,
+            screen,
+            fonts["button"],
+            rect,
+            backend.upper(),
+            backend == selected_backend,
+        )
+
+    metric_y = backend_rects["fast"].bottom + 26
     if last_frame is None:
         lines = [
             "warming up",
+            f"mode {selected_backend}",
             f"temp {args.temperature:.2f}",
             f"threads {args.threads}",
         ]
@@ -244,6 +370,7 @@ def draw_app(
             f"{fps:5.1f} img/s",
             f"{gen_ms:5.1f} ms/gen",
             f"{tok_s / 1000.0:5.1f}k tok/s",
+            f"mode {last_frame.backend}",
             f"frame {int(stats.get('frames', 0))}",
             f"grid {image_grid.filled_slots:3d}/{GRID_SLOTS}",
         ]
@@ -284,15 +411,17 @@ def run() -> None:
     canvas_rect = pygame.Rect(24, 80, canvas_size, canvas_size)
     panel_x = canvas_rect.right + 32
     button_rects = build_button_rects(pygame, panel_x, canvas_rect.y)
+    backend_rects = build_backend_rects(pygame, button_rects)
 
     label_state = LabelState(args.label)
+    backend_state = BackendState(args.backend)
     frames: queue.Queue[GeneratedFrame] = queue.Queue(maxsize=64)
     errors: queue.Queue[BaseException] = queue.Queue(maxsize=1)
     ready = threading.Event()
     stop = threading.Event()
     worker = threading.Thread(
         target=generator_worker,
-        args=(args, label_state, frames, ready, stop, errors),
+        args=(args, label_state, backend_state, frames, ready, stop, errors),
         name="mnist-generator",
         daemon=True,
     )
@@ -313,12 +442,19 @@ def run() -> None:
     try:
         while not stop.is_set():
             selected_before_events = label_state.get()
+            backend_before_events = backend_state.get()
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     stop.set()
                 elif event.type == pygame.KEYDOWN:
                     if event.key in (pygame.K_ESCAPE, pygame.K_q):
                         stop.set()
+                    elif event.key == pygame.K_TAB:
+                        backend_state.set("mlx" if backend_state.get() == "fast" else "fast")
+                    elif event.key == pygame.K_f:
+                        backend_state.set("fast")
+                    elif event.key == pygame.K_m:
+                        backend_state.set("mlx")
                     elif pygame.K_0 <= event.key <= pygame.K_9:
                         label_state.set(event.key - pygame.K_0)
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -326,9 +462,17 @@ def run() -> None:
                         if rect.collidepoint(event.pos):
                             label_state.set(digit)
                             break
+                    for backend, rect in backend_rects.items():
+                        if rect.collidepoint(event.pos):
+                            backend_state.set(backend)
+                            break
 
             selected_label = label_state.get()
-            if selected_label != selected_before_events:
+            selected_backend = backend_state.get()
+            if (
+                selected_label != selected_before_events
+                or selected_backend != backend_before_events
+            ):
                 image_grid.clear(selected_label)
                 last_frame = None
                 while True:
@@ -345,7 +489,10 @@ def run() -> None:
             except queue.Empty:
                 pass
             else:
-                if next_frame.label == label_state.get():
+                if (
+                    next_frame.label == label_state.get()
+                    and next_frame.backend == backend_state.get()
+                ):
                     last_frame = next_frame
                     now = time.perf_counter()
                     image_grid.add(last_frame.image)
@@ -366,7 +513,9 @@ def run() -> None:
                 last_frame,
                 image_grid,
                 label_state,
+                backend_state,
                 button_rects,
+                backend_rects,
                 stats,
                 canvas_rect,
                 panel_x,
@@ -393,9 +542,11 @@ def run() -> None:
         fps = interval_count / elapsed if elapsed > 0 else 0.0
         last_ms = 0.0 if last_frame is None else last_frame.seconds * 1000.0
         last_tok_s = 0.0 if last_frame is None else PIXELS_PER_IMAGE / max(last_frame.seconds, 1e-9)
+        last_backend = "none" if last_frame is None else last_frame.backend
         print(f"frames_rendered={frames_rendered}")
         print(f"display_elapsed_seconds={elapsed:.6f}")
         print(f"display_fps={fps:.3f}")
+        print(f"last_backend={last_backend}")
         print(f"last_generation_ms={last_ms:.3f}")
         print(f"last_tokens_per_second={last_tok_s:.3f}")
 
